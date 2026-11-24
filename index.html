@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="color-scheme" content="dark" />
 <title>Aurora Conifer · 粒子圣诞树</title>
-<meta name="description" content="一棵由数千枚发光粒子构成的圣诞树：极光冷杉。缓慢自转、呼吸、雪落、星芒。" />
+<meta name="description" content="一棵由数千枚发光粒子构成的圣诞树：自由视角、粒子拖尾、短促炫目的闪烁、指尖避让。" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500&display=swap" rel="stylesheet" />
@@ -18,7 +18,11 @@
     -webkit-font-smoothing:antialiased;
     text-rendering:optimizeLegibility;
   }
-  #scene{position:fixed;inset:0;display:block;width:100%;height:100%;cursor:crosshair;touch-action:manipulation}
+  #scene{
+    position:fixed;inset:0;display:block;width:100%;height:100%;
+    cursor:grab;touch-action:none;
+  }
+  #scene.dragging{cursor:grabbing}
 
   .overlay{
     position:fixed;inset:0;pointer-events:none;
@@ -64,7 +68,7 @@
 <div class="overlay">
   <div class="rule"></div>
   <div class="title">MERRY CHRISTMAS</div>
-  <div class="hint">移动视角 · 点击绽开</div>
+  <div class="hint">拖动旋转 · 滚轮缩放 · 触碰驱散</div>
 </div>
 
 <script>
@@ -128,10 +132,16 @@
   }
   const SPR = {};
   for (const k in COL) SPR[k] = glow(COL[k], 0.92, 64);
+  // 闪烁专用的高亮核：白得刺眼，是"晃眼"的来源
+  const SPR_HOT = glow([255, 246, 214], 1, 64);
 
   /* ───────────────────────────── 全局状态 ───────────────────────────── */
   const canvas = document.getElementById('scene');
   const ctx = canvas.getContext('2d', { alpha: false });
+
+  // 拖尾层：树体先画进这里，每帧按比例"抹淡"再叠回主画布
+  const trailCv = document.createElement('canvas');
+  const tctx = trailCv.getContext('2d');
 
   const bloomA = document.createElement('canvas');
   const bA = bloomA.getContext('2d');
@@ -144,12 +154,30 @@
 
   const CFG = {
     camDist: 3.15,
+    camMin: 2.30,
+    camMax: 4.80,
     baseY: -0.56,
     treeH: 1.12,
     baseR: 0.48,
     turns: 4.2,
     tiers: 10,
     revealDur: 1.9,
+    // 视角
+    dragYaw: 0.0055,
+    dragPitch: 0.0042,
+    pitchMin: -0.30,
+    pitchMax: 0.55,
+    idleSpin: 2.9,        // 停止操作多少秒后，自转缓慢接回来
+    spin: 0.085,
+    // 碰触避让
+    pushR: 138,           // 影响半径（px）
+    pushForce: 3400,      // 推力基准（px/s²）
+    // 闪烁
+    flashRate: 26,        // 峰值：每秒新生闪烁数
+    flashDelay: 1.05,     // 松手后多久恢复闪烁
+    flashRamp: 1.7,       // 恢复所用的缓入时长
+    // 拖尾
+    trailBase: 0.255,     // 每 1/60 秒抹淡的比例
   };
 
   let DPR = Math.min(window.devicePixelRatio || 1, 2);
@@ -160,20 +188,52 @@
     t: 0,
     elapsed: 0,
     yaw: 0,
-    autoYaw: 0,
     pitch: 0.10,
-    parallaxX: 0,
-    parallaxY: 0,
-    targetX: 0,
-    targetY: 0,
+    vyaw: 0,
+    vpitch: 0,
+    dist: CFG.camDist,
+    distTarget: CFG.camDist,
     burst: 0,
+    idle: 99,
+    spinW: 1,
+  };
+
+  const pointer = {
+    x: -9999,
+    y: -9999,
+    down: false,
+    active: false,
+    idle: 99,
+  };
+
+  const flash = {
+    budget: 0,
+    on: true,
+    allow: true,          // 触碰期间关闭
+    sinceUp: 99,
+    list: [],             // 本帧有闪烁的粒子
+    live: 0,              // 当前活跃闪烁数
+    total: 0,             // 累计触发次数（调试用）
   };
 
   let particles = [];
+  let lightPool = [];     // 灯/挂饰索引池，闪烁优先照顾它们
   let droplets = [];
   let garland = [];
   let bgStars = [];
   let twinkles = [];
+
+  let cyaw = 1, syaw = 0, cpitch = 1, spitch = 0;
+
+  const quality = { level: 2 };
+  let NO_GRADE = false;
+
+  // 层裙：tier 内向外鼓出，但在层界连续（原公式在层界硬切，俯瞰会露出同心圆环）
+  function tierProfile(u) {
+    const tf = (u * CFG.tiers) % 1;
+    const bell = Math.sin(Math.PI * tf);
+    return (0.84 + 0.24 * Math.pow(bell, 0.8)) * (0.87 + 0.13 * clamp(u / 0.1, 0, 1));
+  }
 
   /* ───────────────────────────── 建树 ───────────────────────────── */
   function buildTree() {
@@ -190,15 +250,15 @@
       const prof = Math.pow(1 - u, 0.92);
       let R = CFG.baseR * prof;
 
-      // 分层裙边：每个 tier 内由上到下外扩，形成冷杉的层叠轮廓
+      // 分层裙边：每个 tier 内向外鼓出，形成冷杉的层叠轮廓
       const tf = (u * CFG.tiers) % 1;
-      R *= (0.80 + 0.28 * Math.pow(tf, 1.7)) * (0.87 + 0.13 * clamp(u / 0.1, 0, 1));
+      R *= tierProfile(u);
 
       // 打破"平盘"感：层缘下垂、全身加一点纵向抖动
       y0 += gauss() * 0.006 + (tf > 0.55 ? (tf - 0.55) * 0.018 * rnd() : 0);
 
       const shell = rnd() < 0.86;
-      const rad = shell ? R * (0.94 + 0.075 * rnd()) : R * Math.pow(rnd(), 0.45) * 0.92;
+      const rad = (shell ? R * (0.94 + 0.075 * rnd()) : R * Math.pow(rnd(), 0.45) * 0.92) * (1 + gauss() * 0.022);
 
       // 20% 的粒子落在螺旋花环上，让"缠绕的灯带"可被看见
       const onHelix = rnd() < 0.20;
@@ -219,6 +279,9 @@
 
       const sizeBase = shell ? 4.2 + 5.0 * rnd() : 3.4 + 4.0 * rnd();
 
+      // 灯与树叶的"体质"差异（刻意做得很轻微）：
+      //   灯  —— 轻、行程长、回弹有余震、闪得频；树叶 —— 沉、行程短、落地即止、几乎只余微光
+      const light = onHelix;
       P.push({
         type: 'tree',
         y0,
@@ -232,12 +295,27 @@
         wob: rr(0.006, 0.03),
         spd: rr(-0.05, 0.05),
         bokeh: shell ? 1 : 1.15,
+        // 物理体质
+        light,
+        mass: light ? 1 : 1.55,           // 越重越"钝"
+        k: light ? 82 : 46,               // 回位刚度
+        damp: light ? 7.0 : 13.0,         // 阻尼（树叶一沉到底）
+        stroke: light ? 1.90 : 0.86,      // 行程
+        pushR: light ? 1.16 : 0.94,
+        swirl: light ? 0.30 : 0.10,       // 被拨开时的绕行感
+        flashW: light ? 3.0 : 0.42,       // 闪烁权重
+        // 累积位移（屏幕空间，px）
+        fpx: 0, fpy: 0, fvx: 0, fvy: 0, moving: false,
+        // 缓存的投影结果，供闪烁层复用
+        px: 0, py: 0, psz: 0, pa: 0, vis: false, pvx: 0, pvy: 0,
+        // 闪烁
+        fl: 0, fls: 0, flDur: 0.12, flPow: 1,
         // 汇聚动画的起始位置：一团散开的星尘
         sx0: gauss() * 1.15,
         sy0: gauss() * 0.95,
         sz0: gauss() * 1.15,
         delay: rnd() * 1.05,
-        // 点击绽开的位移与速度
+        // 绽开的位移与速度（世界空间）
         ox: 0, oy: 0, oz: 0,
         vx: 0, vy: 0, vz: 0,
       });
@@ -247,12 +325,11 @@
     for (let i = 0; i < 110; i++) {
       const u = 0.955 + rnd() * 0.045;
       const y0 = CFG.baseY + u * CFG.treeH;
-      const ang = rnd() * TAU;
       P.push({
         type: 'tree',
         y0,
         r: 0.035 * Math.pow(rnd(), 0.6),
-        a0: ang,
+        a0: rnd() * TAU,
         sz: 3.2 + 3.0 * rnd(),
         kind: rnd() < 0.55 ? 'mint' : 'white',
         base: 0.62,
@@ -261,6 +338,13 @@
         wob: rr(0.01, 0.04),
         spd: rr(-0.06, 0.06),
         bokeh: 1,
+        light: true,
+        mass: 1,
+        k: 88, damp: 6.6, stroke: 2.1, pushR: 1.15, swirl: 0.34,
+        flashW: 2.4,
+        fpx: 0, fpy: 0, fvx: 0, fvy: 0, moving: false,
+        px: 0, py: 0, psz: 0, pa: 0, vis: false, pvx: 0, pvy: 0,
+        fl: 0, fls: 0, flDur: 0.12, flPow: 1,
         sx0: gauss() * 0.8, sy0: 1.2 + gauss() * 0.4, sz0: gauss() * 0.8,
         delay: 0.5 + rnd() * 0.7,
         ox: 0, oy: 0, oz: 0, vx: 0, vy: 0, vz: 0,
@@ -274,8 +358,7 @@
       const y0 = CFG.baseY + u * CFG.treeH;
       const prof = Math.pow(1 - u, 0.92);
       let R = CFG.baseR * prof;
-      const tf = (u * CFG.tiers) % 1;
-      R *= (0.80 + 0.34 * Math.pow(tf, 1.7)) * (0.87 + 0.13 * clamp(u / 0.1, 0, 1));
+      R *= tierProfile(u);
       const ang = u * CFG.turns * TAU + (rnd() - 0.5) * 0.25;
       const roll = rnd();
       const kind = roll < 0.46 ? 'gold' : roll < 0.72 ? 'white' : roll < 0.88 ? 'mint' : 'red';
@@ -292,6 +375,13 @@
         wob: rr(0.004, 0.012),
         spd: rr(-0.04, 0.04),
         bokeh: 0.92,
+        light: true,
+        mass: 1.1,
+        k: 70, damp: 8.4, stroke: 1.65, pushR: 1.22, swirl: 0.26,
+        flashW: 3.4,
+        fpx: 0, fpy: 0, fvx: 0, fvy: 0, moving: false,
+        px: 0, py: 0, psz: 0, pa: 0, vis: false, pvx: 0, pvy: 0,
+        fl: 0, fls: 0, flDur: 0.12, flPow: 1,
         sx0: gauss() * 1.2, sy0: gauss() * 1.0, sz0: gauss() * 1.2,
         delay: 0.3 + rnd() * 0.9,
         ox: 0, oy: 0, oz: 0, vx: 0, vy: 0, vz: 0,
@@ -299,6 +389,8 @@
     }
 
     particles = P;
+    lightPool = [];
+    for (let i = 0; i < P.length; i++) if (P[i].light) lightPool.push(P[i]);
 
     // 花环灯：沿螺旋持续上行，是最显眼的"动态"
     garland = [];
@@ -310,6 +402,7 @@
         ph: rnd() * TAU,
         kind: rnd() < 0.55 ? 'gold' : 'white',
         sz: rr(7, 13),
+        px: 0, py: 0, ox: 0, oy: 0,
       });
     }
 
@@ -338,6 +431,8 @@
     for (let i = 0; i < 26; i++) {
       twinkles.push({ x: rnd(), y: Math.pow(rnd(), 1.3) * 0.9, ph: rnd() * TAU, fq: rr(0.5, 1.6), sz: rr(1.6, 3.4) });
     }
+
+    flash.list.length = 0;
   }
 
   /* ───────────────────────────── 尺寸与背景 ───────────────────────────── */
@@ -355,6 +450,13 @@
     CX = W / 2;
     CY = H * 0.45;
     K = Math.min(H * 0.58, W * 0.86);
+
+    // 拖尾层：低画质时降到 0.72，省一半填充率，且模糊对上辉光反而更好看
+    const TS = quality.level >= 1 ? 1 : 0.72;
+    trailCv.width = Math.max(8, Math.round(W * DPR * TS));
+    trailCv.height = Math.max(8, Math.round(H * DPR * TS));
+    tctx.setTransform(DPR * TS, 0, 0, DPR * TS, 0, 0);
+    tctx.clearRect(0, 0, W, H);
 
     bloomA.width = Math.max(8, Math.round((W * DPR) / 4));
     bloomA.height = Math.max(8, Math.round((H * DPR) / 4));
@@ -447,36 +549,107 @@
     ctx.restore();
   }
 
-  /* ───────────────────────────── 相机 ───────────────────────────── */
-  let cyaw = 1, syaw = 0, cpitch = 1, spitch = 0;
-
+  /* ───────────────────────────── 相机（自由视角） ───────────────────────────── */
   function updateCamera(dt) {
-    state.autoYaw += dt * 0.085;
-    state.parallaxX += (state.targetX - state.parallaxX) * Math.min(1, dt * 2.6);
-    state.parallaxY += (state.targetY - state.parallaxY) * Math.min(1, dt * 2.6);
+    // 松手后的惯性 + 空闲后缓慢接回自转
+    state.idle += dt;
+    const idleW = clamp((state.idle - CFG.idleSpin) / 2.2, 0, 1);
+    state.spinW += (idleW - state.spinW) * Math.min(1, dt * 1.8);
 
-    state.yaw = state.autoYaw + state.parallaxX * 0.62;
-    state.pitch = 0.10 - state.parallaxY * 0.30;
+    if (dragging) {
+      // 拖动中的位移由 pointermove 直接写入，这里只做限幅
+      state.vyaw = clamp(state.vyaw, -9, 9);
+      state.vpitch = clamp(state.vpitch, -9, 9);
+    } else {
+      state.yaw += state.vyaw * dt;
+      state.pitch += state.vpitch * dt;
+      state.vyaw *= Math.exp(-5.5 * dt);
+      state.vpitch *= Math.exp(-5.5 * dt);
+      if (Math.abs(state.vyaw) < 1e-4) state.vyaw = 0;
+      if (Math.abs(state.vpitch) < 1e-4) state.vpitch = 0;
+    }
+
+    // 空闲时才接回自转
+    state.yaw += CFG.spin * dt * state.spinW;
+    state.pitch = clamp(state.pitch, CFG.pitchMin, CFG.pitchMax);
+
+    state.dist += (state.distTarget - state.dist) * Math.min(1, dt * 6.5);
 
     cyaw = Math.cos(state.yaw); syaw = Math.sin(state.yaw);
     cpitch = Math.cos(state.pitch); spitch = Math.sin(state.pitch);
   }
 
-  /* ───────────────────────────── 主绘制 ───────────────────────────── */
+  /* ───────────────────────────── 闪烁 ───────────────────────────── */
+  function updateFlash(dt) {
+    pointer.idle += dt;
+
+    // 手指按住 = 停止闪烁；松开后等一会儿再缓缓接回来
+    if (pointer.down) {
+      flash.allow = false;
+      flash.sinceUp = 0;
+    } else {
+      flash.sinceUp += dt;
+      if (!flash.on) flash.allow = false;
+      else flash.allow = flash.sinceUp > CFG.flashDelay;
+    }
+    const ramp = flash.allow ? clamp((flash.sinceUp - CFG.flashDelay) / CFG.flashRamp, 0, 1) : 0;
+    if (state.elapsed < 2.2) { flash.budget = 0; return; }
+
+    if (ramp > 0) {
+      flash.budget += CFG.flashRate * ramp * dt;
+      while (flash.budget >= 1) {
+        flash.budget -= 1;
+        spawnFlash();
+      }
+    } else {
+      flash.budget = 0;
+    }
+  }
+
+  function spawnFlash(dur) {
+    if (!lightPool.length) return;
+    let p;
+    if (rnd() < 0.66) p = lightPool[(rnd() * lightPool.length) | 0];
+    else p = particles[(rnd() * particles.length) | 0];
+    if (!p || p.fl > 0.35) return;
+
+    const light = p.light;
+    p.fl = 1;
+    p.flDur = dur || (light ? rr(0.115, 0.185) : rr(0.085, 0.135));
+    p.fls = 1 / p.flDur;
+    p.flPow = light ? 1 : 0.52;
+    flash.total++;
+  }
+
+  /* ───────────────────────────── 树体（画进拖尾层） ───────────────────────────── */
   function drawTree(dt) {
     const P = particles;
     const t = state.t;
-    const CAM = CFG.camDist;
+    const CAM = state.dist;
     const kScale = K / 520;
-    const reveal = CFG.revealDur;
     const el = state.elapsed;
     const spring = 34, damp = 7.2;
-    const step = quality === 0 ? 2 : 1;
+    const step = quality.level === 0 ? 2 : 1;
+    const ptrOn = pointer.active;
 
-    ctx.globalCompositeOperation = 'lighter';
+    // 拖尾：把上一帧的画面按比例抹淡（与帧率无关）
+    const fade = clamp(1 - Math.pow(1 - CFG.trailBase, dt * 60), 0, 0.92);
+    tctx.globalCompositeOperation = 'destination-out';
+    tctx.fillStyle = 'rgba(0,0,0,' + fade.toFixed(3) + ')';
+    tctx.fillRect(0, 0, W, H);
+    tctx.globalCompositeOperation = 'lighter';
+
+    const pushR = CFG.pushR;
+    flash.live = 0;
 
     for (let i = 0; i < P.length; i += step) {
       const p = P[i];
+
+      // 闪烁衰减放在最前：被视锥裁掉的粒子也要正常冷却
+      if (p.fl > 0) {
+        p.fl -= p.fls * dt;
+        if (p.fl < 0) p.fl = 0;
+      }
 
       const sw = Math.sin(t * p.fq + p.ph);
       const ang = p.a0 + sw * p.wob + t * p.spd;
@@ -487,7 +660,7 @@
       let Z0 = sa * rad;
       let Y0 = p.y0;
 
-      // 点击绽开后的阻尼弹簧回位
+      // 点击绽开后的阻尼弹簧回位（世界空间）
       if (p.ox !== 0 || p.oy !== 0 || p.oz !== 0 || p.vx !== 0 || p.vy !== 0 || p.vz !== 0) {
         p.vx += (-spring * p.ox - damp * p.vx) * dt;
         p.vy += (-spring * p.oy - damp * p.vy) * dt;
@@ -500,9 +673,9 @@
 
       // 汇聚入场的缓动
       let aMul = 1;
-      if (el < p.delay + reveal) {
-        const k = clamp((el - p.delay) / reveal, 0, 1);
-        if (k <= 0) continue;
+      if (el < p.delay + CFG.revealDur) {
+        const k = clamp((el - p.delay) / CFG.revealDur, 0, 1);
+        if (k <= 0) { p.vis = false; continue; }
         const e = easeOut(k);
         X0 = lerp(p.sx0, X0, e);
         Y0 = lerp(p.sy0, Y0, e);
@@ -517,12 +690,43 @@
       const Z2 = -Y0 * spitch + Z * cpitch;
 
       const d = CAM - Z2;
-      if (d < 0.45) continue;
+      if (d < 0.45) { p.vis = false; continue; }
       const s = CAM / d;
 
-      const px = CX + X * K * s;
-      const py = CY - Y2 * K * s;
-      if (px < -60 || px > W + 60 || py < -60 || py > H + 60) continue;
+      let px = CX + X * K * s;
+      let py = CY - Y2 * K * s;
+
+      // ── 指尖避让：屏幕空间里的排斥 + 自带弹簧回位 ──
+      if (ptrOn || p.moving) {
+        if (ptrOn) {
+          const dx = px - pointer.x;
+          const dy = py - pointer.y;
+          const R = pushR * p.pushR;
+          const d2 = dx * dx + dy * dy;
+          if (d2 < R * R && d2 > 0.5) {
+            const dist = Math.sqrt(d2);
+            const f = 1 - dist / R;
+            const imp = f * f * CFG.pushForce * p.stroke / p.mass;
+            const ux = dx / dist, uy = dy / dist;
+            // 切向分量：被拨开时带一点绕行，像指尖搅过一团光
+            p.fvx += (ux - uy * p.swirl) * imp * dt;
+            p.fvy += (uy + ux * p.swirl) * imp * dt;
+            p.moving = true;
+          }
+        }
+        if (p.moving) {
+          p.fvx += (-p.k * p.fpx - p.damp * p.fvx) * dt;
+          p.fvy += (-p.k * p.fpy - p.damp * p.fvy) * dt;
+          p.fpx += p.fvx * dt;
+          p.fpy += p.fvy * dt;
+          if (!ptrOn && Math.abs(p.fpx) < 0.05 && Math.abs(p.fpy) < 0.05 &&
+              Math.abs(p.fvx) < 0.5 && Math.abs(p.fvy) < 0.5) {
+            p.fpx = 0; p.fpy = 0; p.fvx = 0; p.fvy = 0;
+            p.moving = false;
+          }
+        }
+        px += p.fpx; py += p.fpy;
+      }
 
       const depth = clamp((s - 0.72) / 0.62, 0, 1);
       const bokeh = 1 + 0.55 * (1 - depth);
@@ -535,58 +739,121 @@
         a *= 0.55 + 0.85 * pulse;
       }
 
-      if (a < 0.012 || sz < 0.4) continue;
+      // 缓存投影结果（闪烁层要用）
+      if (px < -80 || px > W + 80 || py < -80 || py > H + 80) { p.vis = false; continue; }
+      if (a < 0.012 || sz < 0.4) { p.vis = false; continue; }
 
-      ctx.globalAlpha = a > 1 ? 1 : a;
-      const sprite = SPR[p.kind];
-      ctx.drawImage(sprite, px - sz * 0.5, py - sz * 0.5, sz, sz);
+      const prevA = p.pa;
+      p.pvx = px - p.px; p.pvy = py - p.py;
+      p.px = px; p.py = py; p.psz = sz; p.pa = a; p.vis = true;
+
+      tctx.globalAlpha = a > 1 ? 1 : a;
+      tctx.drawImage(SPR[p.kind], px - sz * 0.5, py - sz * 0.5, sz, sz);
+
+      // 灯比叶子"轻"：移动时留下更长的彗尾（叶子靠整层拖尾，灯额外补两段鬼影）
+      if (p.light && prevA > 0.02) {
+        const sp2 = p.pvx * p.pvx + p.pvy * p.pvy;
+        if (sp2 > 1.6) {
+          const sp = Math.sqrt(sp2);
+          const tl = Math.min(30, sp * 1.25);
+          const nx = p.pvx / sp, ny = p.pvy / sp;
+          for (let q = 1; q <= 2; q++) {
+            const fq2 = q * 0.5;
+            tctx.globalAlpha = a * (0.30 / q);
+            const gx = px - nx * tl * fq2, gy = py - ny * tl * fq2;
+            tctx.drawImage(SPR[p.kind], gx - sz * 0.44, gy - sz * 0.44, sz * 0.88, sz * 0.88);
+          }
+        }
+      }
+
+      if (p.fl > 0) flash.list[flash.live++] = p;
+    }
+    flash.list.length = Math.max(flash.live, flash.list.length);
+  }
+
+  /* ───────────────────────────── 闪烁层（画在主画布，保持凌厉） ───────────────────────────── */
+  function drawFlashes() {
+    const L = flash.list;
+    for (let i = 0; i < flash.live; i++) {
+      const p = L[i];
+      if (!p.vis || p.fl <= 0) continue;
+      const e = Math.pow(p.fl, 1.7) * p.flPow;
+      if (e < 0.02) continue;
+
+      const px = p.px, py = p.py, sz = p.psz;
+
+      // 外圈炫光：让它在泛光里"炸"一下
+      const halo = sz * (2.2 + 4.6 * e);
+      ctx.globalAlpha = Math.min(1, 0.42 * e);
+      ctx.drawImage(SPR[p.kind], px - halo * 0.5, py - halo * 0.5, halo, halo);
+
+      // 高亮核：白得刺眼，短促
+      const core = sz * (1.05 + 1.75 * e);
+      ctx.globalAlpha = Math.min(1, 0.92 * e);
+      ctx.drawImage(SPR_HOT, px - core * 0.5, py - core * 0.5, core, core);
     }
   }
 
+  /* ───────────────────────────── 花环灯（带彗尾） ───────────────────────────── */
   function drawGarland() {
     const t = state.t;
-    const CAM = CFG.camDist;
+    const CAM = state.dist;
     const kScale = K / 520;
+    const fade = clamp((state.elapsed - 1.6) / 1.2, 0, 1);
+    if (fade <= 0) return;
 
     for (let i = 0; i < garland.length; i++) {
       const g = garland[i];
-      const u = (g.off + t * g.speed) % 1;
-      const y0 = CFG.baseY + u * CFG.treeH;
-      const prof = Math.pow(1 - u, 0.92);
-      let R = CFG.baseR * prof;
-      const tf = (u * CFG.tiers) % 1;
-      R *= (0.80 + 0.34 * Math.pow(tf, 1.7)) * (0.87 + 0.13 * clamp(u / 0.1, 0, 1));
-      const ang = u * CFG.turns * TAU + 0.16;
-      const X0 = Math.cos(ang) * R * 1.06;
-      const Z0 = Math.sin(ang) * R * 1.06;
 
-      const X = X0 * cyaw + Z0 * syaw;
-      const Z = -X0 * syaw + Z0 * cyaw;
-      const Y2 = y0 * cpitch + Z * spitch;
-      const Z2 = -y0 * spitch + Z * cpitch;
-      const d = CAM - Z2;
-      if (d < 0.45) continue;
-      const s = CAM / d;
-      const px = CX + X * K * s;
-      const py = CY - Y2 * K * s;
+      let prevX = 0, prevY = 0;
+      for (let q = 0; q < 3; q++) {
+        const tt = t - q * 0.055;
+        const u = (g.off + tt * g.speed) % 1;
+        const y0 = CFG.baseY + u * CFG.treeH;
+        const prof = Math.pow(1 - u, 0.92);
+        let R = CFG.baseR * prof;
+      R *= tierProfile(u);
+        const ang = u * CFG.turns * TAU + 0.16;
+        const X0 = Math.cos(ang) * R * 1.06;
+        const Z0 = Math.sin(ang) * R * 1.06;
 
-      const fade = clamp((state.elapsed - 1.6) / 1.2, 0, 1);
-      const pulse = 0.5 + 0.5 * Math.sin(t * 2.4 + g.ph * 3.1);
-      const sz = g.sz * kScale * s * (0.75 + 0.35 * pulse);
-      const a = (0.34 + 0.5 * pulse) * fade;
+        const X = X0 * cyaw + Z0 * syaw;
+        const Z = -X0 * syaw + Z0 * cyaw;
+        const Y2 = y0 * cpitch + Z * spitch;
+        const Z2 = -y0 * spitch + Z * cpitch;
+        const d = CAM - Z2;
+        if (d < 0.45) break;
+        const s = CAM / d;
+        const px = CX + X * K * s;
+        const py = CY - Y2 * K * s;
 
-      ctx.globalAlpha = a;
-      ctx.drawImage(SPR[g.kind], px - sz * 0.5, py - sz * 0.5, sz, sz);
-      if (pulse > 0.82) {
-        const halo = sz * 2.6;
-        ctx.globalAlpha = a * 0.35;
-        ctx.drawImage(SPR[g.kind], px - halo * 0.5, py - halo * 0.5, halo, halo);
+        if (q === 0) {
+          const pulse = 0.5 + 0.5 * Math.sin(t * 2.4 + g.ph * 3.1);
+          const sz = g.sz * kScale * s * (0.75 + 0.35 * pulse);
+          const a = (0.34 + 0.5 * pulse) * fade;
+
+          ctx.globalAlpha = a;
+          ctx.drawImage(SPR[g.kind], px - sz * 0.5, py - sz * 0.5, sz, sz);
+          if (pulse > 0.82) {
+            const halo = sz * 2.6;
+            ctx.globalAlpha = a * 0.35;
+            ctx.drawImage(SPR[g.kind], px - halo * 0.5, py - halo * 0.5, halo, halo);
+          }
+          g.px = px; g.py = py; g.szPix = sz; g.sPix = s;
+          prevX = px; prevY = py;
+        } else {
+          // 彗尾：越往后越淡越小
+          const k = 1 - q * 0.34;
+          ctx.globalAlpha = 0.20 * k * fade;
+          const tsz = g.szPix * (0.86 - q * 0.16);
+          ctx.drawImage(SPR[g.kind], px - tsz * 0.5, py - tsz * 0.5, tsz, tsz);
+        }
       }
     }
   }
 
   function drawSnow(front) {
-    const CAM = CFG.camDist;
+    const CAM = state.dist;
     const kScale = K / 520;
 
     for (let i = 0; i < droplets.length; i++) {
@@ -617,8 +884,7 @@
   }
 
   function drawStar() {
-    const CAM = CFG.camDist;
-    // 树梢位置
+    const CAM = state.dist;
     const y0 = CFG.baseY + CFG.treeH + 0.055;
     const Y2 = y0 * cpitch;
     const Z2 = -y0 * spitch;
@@ -633,7 +899,6 @@
     const pulse = 0.86 + 0.14 * Math.sin(t * 1.55);
     const R = 0.078 * K * s * pulse;
 
-    // 大光晕
     const halo = R * 9.0;
     ctx.globalAlpha = 0.22 * fade;
     ctx.drawImage(SPR.gold, px - halo * 0.5, py - halo * 0.5, halo, halo);
@@ -697,13 +962,11 @@
   let last = performance.now();
   let fpsAcc = 0, fpsFrames = 0, fps = 60;
 
-  // 自适应画质：只在持续掉帧时降级，且不可回升，避免画面反复跳动
-  const NO_GRADE = new URLSearchParams(location.search).has('hq');
-  let quality = 2;
   let perfClock = 0, perfFrames = 0, gradeHold = 4;
 
   function render(dt) {
     updateCamera(dt);
+    updateFlash(dt);
 
     // 雪的下落
     for (let i = 0; i < droplets.length; i++) {
@@ -729,7 +992,14 @@
 
     ctx.globalCompositeOperation = 'lighter';
     drawSnow(false);
+
+    // 树体：先画进拖尾层（内部自带抹淡），再整体叠回
     drawTree(dt);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = 1;
+    ctx.drawImage(trailCv, 0, 0, W, H);
+
+    drawFlashLayer();
     drawGarland();
     drawSnow(true);
     drawStar();
@@ -740,7 +1010,7 @@
 
     bA.clearRect(0, 0, bloomA.width, bloomA.height);
     bA.drawImage(canvas, 0, 0, bloomA.width, bloomA.height);
-    if (quality >= 2) {
+    if (quality.level >= 2) {
       bB.clearRect(0, 0, bloomB.width, bloomB.height);
       bB.drawImage(canvas, 0, 0, bloomB.width, bloomB.height);
     }
@@ -748,7 +1018,7 @@
     ctx.globalCompositeOperation = 'lighter';
     ctx.globalAlpha = 0.34;
     ctx.drawImage(bloomA, 0, 0, W, H);
-    if (quality >= 2) {
+    if (quality.level >= 2) {
       ctx.globalAlpha = 0.28;
       ctx.drawImage(bloomB, 0, 0, W, H);
     }
@@ -760,13 +1030,18 @@
     ctx.fillRect(0, 0, W, H);
   }
 
+  function drawFlashLayer() {
+    ctx.globalCompositeOperation = 'lighter';
+    drawFlashes();
+  }
+
   function frame(now) {
     requestAnimationFrame(frame);
 
     let raw = (now - last) / 1000;
     last = now;
     if (!isFinite(raw) || raw < 0) raw = 0;
-    raw = Math.min(raw, 1 / 30);
+    raw = Math.min(raw, 1 / 20);
 
     state.elapsed += raw;
     const dt = raw * MOTION;
@@ -780,8 +1055,8 @@
     if (perfClock >= 2) {
       const measured = perfFrames / perfClock;
       perfClock = 0; perfFrames = 0;
-      if (!NO_GRADE && quality > 0 && state.elapsed > 4 && gradeHold <= 0 && measured < 38) {
-        quality--;
+      if (!NO_GRADE && quality.level > 0 && state.elapsed > 4 && gradeHold <= 0 && measured < 38) {
+        quality.level--;
         gradeHold = 4;
       }
     }
@@ -803,19 +1078,81 @@
     }
   }
 
+  let dragging = false;
+  let dragX = 0, dragY = 0;
+  let moved = 0;
+
+  function pointAt(e) {
+    pointer.x = e.clientX;
+    pointer.y = e.clientY;
+  }
+
   window.addEventListener('pointermove', (e) => {
-    state.targetX = (e.clientX / window.innerWidth - 0.5) * 2;
-    state.targetY = (e.clientY / window.innerHeight - 0.5) * 2;
+    pointAt(e);
+    pointer.active = true;
+    pointer.idle = 0;
+    state.idle = 0;
+
+    if (dragging) {
+      const dx = e.clientX - dragX;
+      const dy = e.clientY - dragY;
+      dragX = e.clientX; dragY = e.clientY;
+      moved += Math.abs(dx) + Math.abs(dy);
+
+      state.yaw += dx * CFG.dragYaw;
+      state.pitch = clamp(state.pitch + dy * CFG.dragPitch, CFG.pitchMin, CFG.pitchMax);
+      state.vyaw = dx * CFG.dragYaw * 30;
+      state.vpitch = dy * CFG.dragPitch * 30;
+    }
   }, { passive: true });
 
   window.addEventListener('pointerdown', (e) => {
-    if (e.target !== canvas) return;
-    burst();
+    pointAt(e);
+    pointer.down = true;
+    pointer.active = true;
+    pointer.idle = 0;
+    state.idle = 0;
+    state.spinW = 0;
+    dragging = true;
+    dragX = e.clientX; dragY = e.clientY;
+    moved = 0;
+    if (e.target === canvas) canvas.classList.add('dragging');
+    if (canvas.setPointerCapture && e.pointerId !== undefined) {
+      try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+    }
   });
+
+  function endPointer(e) {
+    if (e) pointAt(e);
+    pointer.down = false;
+    pointer.active = false;
+    pointer.idle = 0;
+    dragging = false;
+    canvas.classList.remove('dragging');
+  }
+
+  window.addEventListener('pointerup', endPointer);
+  window.addEventListener('pointercancel', endPointer);
+  window.addEventListener('pointerleave', (e) => {
+    pointer.active = false;
+    if (!pointer.down) pointer.idle = 0;
+  });
+
+  // 滚轮缩放（自由视角的"远近"）
+  window.addEventListener('wheel', (e) => {
+    if (e.target !== canvas) return;
+    e.preventDefault();
+    state.distTarget = clamp(state.distTarget + Math.sign(e.deltaY) * 0.14, CFG.camMin, CFG.camMax);
+    state.idle = 0;
+  }, { passive: false });
 
   window.addEventListener('keydown', (e) => {
     if (e.code === 'Space') { e.preventDefault(); burst(); }
+    if (e.key === 'f' || e.key === 'F') flash.on = !flash.on;
   });
+
+  // 双击绽开（单击留给"触碰驱散"，避免两种反馈打架）
+  canvas.addEventListener('dblclick', (e) => { e.preventDefault(); burst(); });
 
   let resizeTimer = 0;
   window.addEventListener('resize', () => {
@@ -826,24 +1163,69 @@
   window.addEventListener('orientationchange', () => setTimeout(resize, 220));
 
   /* ───────────────────────────── 启动 ───────────────────────────── */
+  NO_GRADE = new URLSearchParams(location.search).has('hq');
+
   buildTree();
   resize();
-  // 若在 resize 之前就确定了粒子数，这里只需保证尺寸正确
   requestAnimationFrame((t) => { last = t; frame(t); });
 
   window.__tree = {
     get fps() { return fps; },
-    get quality() { return quality; },
+    get quality() { return quality.level; },
     get count() { return particles.length; },
     state,
+    cam: state,
+    pointer,
+    flash,
     burst,
+    setFlash(v) { flash.on = !!v; },
+    // 质检用：把时间推进到 t 并立刻渲染一帧
     seek(t) {
-      // 质检用：把时间推进到 t 并立刻渲染一帧
       state.elapsed = Math.max(state.elapsed, t + CFG.revealDur);
       state.t = t;
-      state.autoYaw = t * 0.085;
+      state.yaw = t * CFG.spin;
+      state.idle = 99;
+      tctx.clearRect(0, 0, W, H);
       updateCamera(1 / 60);
+      for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        p.fpx = 0; p.fpy = 0; p.fvx = 0; p.fvy = 0; p.moving = false; p.fl = 0;
+      }
+      flash.live = 0;
       render(1 / 60);
+      render(1 / 60);
+    },
+    // 质检修：把指针放到某点并当作按住，检查驱散与停闪
+    touch(x, y, down) {
+      pointer.x = x; pointer.y = y;
+      pointer.active = true;
+      pointer.down = !!down;
+      pointer.idle = 0;
+      state.idle = 0;
+    },
+    release() { pointer.down = false; pointer.active = false; pointer.idle = 0; },
+    // 质检修：总位移量，用来断言"是否回到原位"
+    offsetSum() {
+      let s = 0;
+      for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        s += Math.abs(p.fpx) + Math.abs(p.fpy);
+      }
+      return s;
+    },
+    // 质检修：以固定步长推进若干帧（不受无头浏览器低帧率影响）
+    step(dtFixed, n) {
+      const d = dtFixed || 1 / 60;
+      for (let i = 0; i < n; i++) {
+        state.elapsed += d;
+        state.t += d;
+        render(d);
+      }
+    },
+    // 质检修：批量触发闪烁（dur 用于把闪烁定格在长曝光上，方便截图核对）
+    forceFlash(n, dur) {
+      for (let i = 0; i < n; i++) spawnFlash(dur);
+      return flash.total;
     },
   };
 })();
